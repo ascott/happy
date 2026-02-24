@@ -20,4 +20,10 @@ config.transformer.getTransformOptions = async () => ({
   },
 });
 
+// Polyfill Node.js built-ins required by some packages (e.g. react-native-svg)
+config.resolver.extraNodeModules = {
+  ...config.resolver.extraNodeModules,
+  buffer: require.resolve('buffer'),
+};
+
 module.exports = config;
