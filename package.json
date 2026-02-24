@@ -18,5 +18,8 @@
             "**/react-native-incall-manager/**"
         ]
     },
-    "packageManager": "yarn@1.22.22"
+    "packageManager": "yarn@1.22.22",
+    "dependencies": {
+        "buffer": "^6.0.3"
+    }
 }
