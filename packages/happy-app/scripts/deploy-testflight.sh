@@ -12,7 +12,7 @@ if [ -f "$HOME/.zshrc" ]; then
     eval "$(grep '^export ' "$HOME/.zshrc" 2>/dev/null)" || true
 fi
 
-export PATH="/opt/homebrew/opt/node@22/bin:$PATH"
+export PATH="/opt/homebrew/opt/node@22/bin:/opt/homebrew/bin:$PATH"
 export LANG="${LANG:-en_US.UTF-8}"
 export LC_ALL="${LC_ALL:-en_US.UTF-8}"
 export APP_ENV=production
