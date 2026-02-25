@@ -253,6 +253,12 @@ export function reducer(state: ReducerState, messages: NormalizedMessage[], agen
             continue;
         }
 
+        // Session protocol turn-start markers are lifecycle-only and should stay invisible.
+        if (msg.role === 'event' && msg.content.type === 'message' && msg.content.message === 'Turn started') {
+            state.messageIds.set(msg.id, msg.id);
+            continue;
+        }
+
         // Handle context reset events - reset state and let the message be shown
         if (msg.role === 'event' && msg.content.type === 'message' && msg.content.message === 'Context was reset') {
             // Reset todos to empty array and reset usage to zero
@@ -638,7 +644,7 @@ export function reducer(state: ReducerState, messages: NormalizedMessage[], agen
                         realID: msg.id,
                         role: 'agent',
                         createdAt: msg.createdAt,
-                        text: isThinking ? `*Thinking...*\n\n*${c.thinking}*` : c.text,
+                        text: isThinking ? `*${c.thinking}*` : c.text,
                         isThinking,
                         tool: null,
                         event: null,
@@ -871,7 +877,7 @@ export function reducer(state: ReducerState, messages: NormalizedMessage[], agen
                         realID: msg.id,
                         role: 'agent',
                         createdAt: msg.createdAt,
-                        text: isThinking ? `*Thinking...*\n\n*${c.thinking}*` : c.text,
+                        text: isThinking ? `*${c.thinking}*` : c.text,
                         isThinking,
                         tool: null,
                         event: null,

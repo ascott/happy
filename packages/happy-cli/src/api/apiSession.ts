@@ -1,9 +1,9 @@
 import { logger } from '@/ui/logger'
 import { EventEmitter } from 'node:events'
 import { io, Socket } from 'socket.io-client'
-import { AgentState, ClientToServerEvents, MessageContent, Metadata, ServerToClientEvents, Session, Update, UserMessage, UserMessageSchema, Usage } from './types'
+import { AgentState, ClientToServerEvents, Metadata, ServerToClientEvents, Session, Update, UserMessage, UserMessageSchema, Usage } from './types'
 import { decodeBase64, decrypt, encodeBase64, encrypt } from './encryption';
-import { backoff } from '@/utils/time';
+import { backoff, delay } from '@/utils/time';
 import { configuration } from '@/configuration';
 import { RawJSONLines } from '@/claude/types';
 import { randomUUID } from 'node:crypto';
@@ -11,6 +11,14 @@ import { AsyncLock } from '@/utils/lock';
 import { RpcHandlerManager } from './rpc/RpcHandlerManager';
 import { registerCommonHandlers } from '../modules/common/registerCommonHandlers';
 import { calculateCost } from '@/utils/pricing';
+import { type SessionEnvelope, type SessionTurnEndStatus } from '@slopus/happy-wire';
+import {
+    closeClaudeTurnWithStatus,
+    mapClaudeLogMessageToSessionEnvelopes,
+    type ClaudeSessionProtocolState,
+} from '@/claude/utils/sessionProtocolMapper';
+import { InvalidateSync } from '@/utils/sync';
+import axios from 'axios';
 
 /**
  * ACP (Agent Communication Protocol) message data types.
@@ -39,6 +47,30 @@ export type ACPMessageData =
 
 export type ACPProvider = 'gemini' | 'codex' | 'claude' | 'opencode';
 
+type V3SessionMessage = {
+    id: string;
+    seq: number;
+    content: { t: 'encrypted'; c: string };
+    localId: string | null;
+    createdAt: number;
+    updatedAt: number;
+};
+
+type V3GetSessionMessagesResponse = {
+    messages: V3SessionMessage[];
+    hasMore: boolean;
+};
+
+type V3PostSessionMessagesResponse = {
+    messages: Array<{
+        id: string;
+        seq: number;
+        localId: string | null;
+        createdAt: number;
+        updatedAt: number;
+    }>;
+};
+
 export class ApiSessionClient extends EventEmitter {
     private readonly token: string;
     readonly sessionId: string;
@@ -54,6 +86,21 @@ export class ApiSessionClient extends EventEmitter {
     private metadataLock = new AsyncLock();
     private encryptionKey: Uint8Array;
     private encryptionVariant: 'legacy' | 'dataKey';
+    private claudeSessionProtocolState: ClaudeSessionProtocolState = {
+        currentTurnId: null,
+        uuidToProviderSubagent: new Map<string, string>(),
+        taskPromptToSubagents: new Map<string, string[]>(),
+        providerSubagentToSessionSubagent: new Map<string, string>(),
+        subagentTitles: new Map<string, string>(),
+        bufferedSubagentMessages: new Map<string, RawJSONLines[]>(),
+        hiddenParentToolCalls: new Set<string>(),
+        startedSubagents: new Set<string>(),
+        activeSubagents: new Set<string>(),
+    };
+    private lastSeq = 0;
+    private pendingOutbox: Array<{ content: string; localId: string }> = [];
+    private readonly sendSync: InvalidateSync;
+    private readonly receiveSync: InvalidateSync;
 
     constructor(token: string, session: Session) {
         super()
@@ -65,6 +112,8 @@ export class ApiSessionClient extends EventEmitter {
         this.agentStateVersion = session.agentStateVersion;
         this.encryptionKey = session.encryptionKey;
         this.encryptionVariant = session.encryptionVariant;
+        this.sendSync = new InvalidateSync(() => this.flushOutbox());
+        this.receiveSync = new InvalidateSync(() => this.fetchMessages());
 
         // Initialize RPC handler manager
         this.rpcHandlerManager = new RpcHandlerManager({
@@ -102,6 +151,7 @@ export class ApiSessionClient extends EventEmitter {
         this.socket.on('connect', () => {
             logger.debug('Socket connected successfully');
             this.rpcHandlerManager.onSocketConnect(this.socket);
+            this.receiveSync.invalidate();
         })
 
         // Set up global RPC request handler
@@ -129,24 +179,20 @@ export class ApiSessionClient extends EventEmitter {
                     return;
                 }
 
-                if (data.body.t === 'new-message' && data.body.message.content.t === 'encrypted') {
-                    const body = decrypt(this.encryptionKey, this.encryptionVariant, decodeBase64(data.body.message.content.c));
-
-                    logger.debugLargeJson('[SOCKET] [UPDATE] Received update:', body)
-
-                    // Try to parse as user message first
-                    const userResult = UserMessageSchema.safeParse(body);
-                    if (userResult.success) {
-                        // Server already filtered to only our session
-                        if (this.pendingMessageCallback) {
-                            this.pendingMessageCallback(userResult.data);
-                        } else {
-                            this.pendingMessages.push(userResult.data);
-                        }
-                    } else {
-                        // If not a user message, it might be a permission response or other message type
-                        this.emit('message', body);
+                if (data.body.t === 'new-message') {
+                    const messageSeq = data.body.message?.seq;
+                    if (this.lastSeq === 0) {
+                        this.receiveSync.invalidate();
+                        return;
                     }
+                    if (typeof messageSeq !== 'number' || messageSeq !== this.lastSeq + 1 || data.body.message.content.t !== 'encrypted') {
+                        this.receiveSync.invalidate();
+                        return;
+                    }
+                    const body = decrypt(this.encryptionKey, this.encryptionVariant, decodeBase64(data.body.message.content.c));
+                    logger.debugLargeJson('[SOCKET] [UPDATE] Received update:', body)
+                    this.routeIncomingMessage(body);
+                    this.lastSeq = messageSeq;
                 } else if (data.body.t === 'update-session') {
                     if (data.body.metadata && data.body.metadata.version > this.metadataVersion) {
                         this.metadata = decrypt(this.encryptionKey, this.encryptionVariant, decodeBase64(data.body.metadata.value));
@@ -187,53 +233,128 @@ export class ApiSessionClient extends EventEmitter {
         }
     }
 
+    private authHeaders() {
+        return {
+            'Authorization': `Bearer ${this.token}`,
+            'Content-Type': 'application/json'
+        };
+    }
+
+    private routeIncomingMessage(message: unknown) {
+        const userResult = UserMessageSchema.safeParse(message);
+        if (userResult.success) {
+            if (this.pendingMessageCallback) {
+                this.pendingMessageCallback(userResult.data);
+            } else {
+                this.pendingMessages.push(userResult.data);
+            }
+            return;
+        }
+        this.emit('message', message);
+    }
+
+    private async fetchMessages() {
+        let afterSeq = this.lastSeq;
+        while (true) {
+            const response = await axios.get<V3GetSessionMessagesResponse>(
+                `${configuration.serverUrl}/v3/sessions/${encodeURIComponent(this.sessionId)}/messages`,
+                {
+                    params: {
+                        after_seq: afterSeq,
+                        limit: 100
+                    },
+                    headers: this.authHeaders(),
+                    timeout: 60000
+                }
+            );
+
+            const messages = Array.isArray(response.data.messages) ? response.data.messages : [];
+            let maxSeq = afterSeq;
+
+            for (const message of messages) {
+                if (message.seq > maxSeq) {
+                    maxSeq = message.seq;
+                }
+
+                if (message.content?.t !== 'encrypted') {
+                    continue;
+                }
+
+                try {
+                    const body = decrypt(this.encryptionKey, this.encryptionVariant, decodeBase64(message.content.c));
+                    this.routeIncomingMessage(body);
+                } catch (error) {
+                    logger.debug('[API] Failed to decrypt fetched message', {
+                        sessionId: this.sessionId,
+                        seq: message.seq,
+                        error
+                    });
+                }
+            }
+
+            this.lastSeq = Math.max(this.lastSeq, maxSeq);
+            const hasMore = !!response.data.hasMore;
+            if (hasMore && maxSeq === afterSeq) {
+                logger.debug('[API] fetchMessages pagination stalled, stopping to avoid infinite loop', {
+                    sessionId: this.sessionId,
+                    afterSeq
+                });
+                break;
+            }
+            afterSeq = maxSeq;
+            if (!hasMore) {
+                break;
+            }
+        }
+    }
+
+    private async flushOutbox() {
+        if (this.pendingOutbox.length === 0) {
+            return;
+        }
+
+        const batch = this.pendingOutbox.slice();
+        const response = await axios.post<V3PostSessionMessagesResponse>(
+            `${configuration.serverUrl}/v3/sessions/${encodeURIComponent(this.sessionId)}/messages`,
+            {
+                messages: batch
+            },
+            {
+                headers: this.authHeaders(),
+                timeout: 60000
+            }
+        );
+
+        this.pendingOutbox.splice(0, batch.length);
+
+        const messages = Array.isArray(response.data.messages) ? response.data.messages : [];
+        const maxSeq = messages.reduce((acc, message) => (
+            message.seq > acc ? message.seq : acc
+        ), this.lastSeq);
+        this.lastSeq = maxSeq;
+    }
+
+    private enqueueMessage(content: unknown, invalidate: boolean = true) {
+        const encrypted = encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, content));
+        this.pendingOutbox.push({
+            content: encrypted,
+            localId: randomUUID()
+        });
+        if (invalidate) {
+            this.sendSync.invalidate();
+        }
+    }
+
     /**
      * Send message to session
      * @param body - Message body (can be MessageContent or raw content for agent messages)
      */
     sendClaudeSessionMessage(body: RawJSONLines) {
-        let content: MessageContent;
-
-        // Check if body is already a MessageContent (has role property)
-        if (body.type === 'user' && typeof body.message.content === 'string' && body.isSidechain !== true && body.isMeta !== true) {
-            content = {
-                role: 'user',
-                content: {
-                    type: 'text',
-                    text: body.message.content
-                },
-                meta: {
-                    sentFrom: 'cli'
-                }
-            }
-        } else {
-            // Wrap Claude messages in the expected format
-            content = {
-                role: 'agent',
-                content: {
-                    type: 'output',
-                    data: body  // This wraps the entire Claude message
-                },
-                meta: {
-                    sentFrom: 'cli'
-                }
-            };
+        const mapped = mapClaudeLogMessageToSessionEnvelopes(body, this.claudeSessionProtocolState);
+        this.claudeSessionProtocolState.currentTurnId = mapped.currentTurnId;
+        for (const envelope of mapped.envelopes) {
+            this.sendSessionProtocolMessage(envelope);
         }
-
-        logger.debugLargeJson('[SOCKET] Sending message through socket:', content)
-
-        // Check if socket is connected before sending
-        if (!this.socket.connected) {
-            logger.debug('[API] Socket not connected, cannot send Claude session message. Message will be lost:', { type: body.type });
-            return;
-        }
-
-        const encrypted = encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, content));
-        this.socket.emit('message', {
-            sid: this.sessionId,
-            message: encrypted
-        });
-
         // Track usage from assistant messages
         if (body.type === 'assistant' && body.message?.usage) {
             try {
@@ -255,6 +376,14 @@ export class ApiSessionClient extends EventEmitter {
         }
     }
 
+    closeClaudeSessionTurn(status: SessionTurnEndStatus = 'completed') {
+        const mapped = closeClaudeTurnWithStatus(this.claudeSessionProtocolState, status);
+        this.claudeSessionProtocolState.currentTurnId = mapped.currentTurnId;
+        for (const envelope of mapped.envelopes) {
+            this.sendSessionProtocolMessage(envelope);
+        }
+    }
+
     sendCodexMessage(body: any) {
         let content = {
             role: 'agent',
@@ -266,18 +395,33 @@ export class ApiSessionClient extends EventEmitter {
                 sentFrom: 'cli'
             }
         };
-        const encrypted = encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, content));
+        this.enqueueMessage(content);
+    }
 
-        // Check if socket is connected before sending
-        if (!this.socket.connected) {
-            logger.debug('[API] Socket not connected, cannot send message. Message will be lost:', { type: body.type });
-            // TODO: Consider implementing message queue or HTTP fallback for reliability
+    private enqueueSessionProtocolEnvelope(envelope: SessionEnvelope, invalidate: boolean = true) {
+        const content = {
+            role: 'session',
+            content: envelope,
+            meta: {
+                sentFrom: 'cli'
+            }
+        };
+
+        this.enqueueMessage(content, invalidate);
+    }
+
+    sendSessionProtocolMessage(envelope: SessionEnvelope) {
+        if (envelope.role !== 'user') {
+            this.enqueueSessionProtocolEnvelope(envelope);
+            return;
         }
 
-        this.socket.emit('message', {
-            sid: this.sessionId,
-            message: encrypted
-        });
+        if (envelope.ev.t !== 'text') {
+            this.enqueueSessionProtocolEnvelope(envelope);
+            return;
+        }
+
+        this.enqueueSessionProtocolEnvelope(envelope);
     }
 
     /**
@@ -302,11 +446,7 @@ export class ApiSessionClient extends EventEmitter {
 
         logger.debug(`[SOCKET] Sending ACP message from ${provider}:`, { type: body.type, hasMessage: 'message' in body });
 
-        const encrypted = encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, content));
-        this.socket.emit('message', {
-            sid: this.sessionId,
-            message: encrypted
-        });
+        this.enqueueMessage(content);
     }
 
     sendSessionEvent(event: {
@@ -326,11 +466,7 @@ export class ApiSessionClient extends EventEmitter {
                 data: event
             }
         };
-        const encrypted = encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, content));
-        this.socket.emit('message', {
-            sid: this.sessionId,
-            message: encrypted
-        });
+        this.enqueueMessage(content);
     }
 
     /**
@@ -442,6 +578,10 @@ export class ApiSessionClient extends EventEmitter {
      * Wait for socket buffer to flush
      */
     async flush(): Promise<void> {
+        await Promise.race([
+            this.sendSync.invalidateAndAwait(),
+            delay(10000)
+        ]);
         if (!this.socket.connected) {
             return;
         }
@@ -457,6 +597,8 @@ export class ApiSessionClient extends EventEmitter {
 
     async close() {
         logger.debug('[API] socket.close() called');
+        this.sendSync.stop();
+        this.receiveSync.stop();
         this.socket.close();
     }
 }

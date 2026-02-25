@@ -25,9 +25,11 @@ import { runDoctorCommand } from './ui/doctor'
 import { listDaemonSessions, stopDaemonSession } from './daemon/controlClient'
 import { handleAuthCommand } from './commands/auth'
 import { handleConnectCommand } from './commands/connect'
+import { handleSandboxCommand } from './commands/sandbox'
 import { spawnHappyCLI } from './utils/spawnHappyCLI'
 import { claudeCliPath } from './claude/claudeLocal'
 import { execFileSync } from 'node:child_process'
+import { extractNoSandboxFlag } from './utils/sandboxFlags'
 
 
 (async () => {
@@ -81,6 +83,20 @@ import { execFileSync } from 'node:child_process'
       process.exit(1)
     }
     return;
+  } else if (subcommand === 'sandbox') {
+    try {
+      await handleSandboxCommand(args.slice(1));
+    } catch (error) {
+      console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error')
+      if (process.env.DEBUG) {
+        console.error(error)
+      }
+      process.exit(1)
+    }
+    return;
+  } else if (subcommand === 'bye') {
+    console.log('Bye!');
+    process.exit(0);
   } else if (subcommand === 'codex') {
     // Handle codex command
     try {
@@ -88,16 +104,17 @@ import { execFileSync } from 'node:child_process'
       
       // Parse startedBy argument
       let startedBy: 'daemon' | 'terminal' | undefined = undefined;
-      for (let i = 1; i < args.length; i++) {
-        if (args[i] === '--started-by') {
-          startedBy = args[++i] as 'daemon' | 'terminal';
+      const codexArgs = extractNoSandboxFlag(args.slice(1));
+      for (let i = 0; i < codexArgs.args.length; i++) {
+        if (codexArgs.args[i] === '--started-by') {
+          startedBy = codexArgs.args[++i] as 'daemon' | 'terminal';
         }
       }
       
       const {
         credentials
       } = await authAndSetupMachineIfNeeded();
-      await runCodex({credentials, startedBy});
+      await runCodex({credentials, startedBy, noSandbox: codexArgs.noSandbox});
       // Do not force exit here; allow instrumentation to show lingering handles
     } catch (error) {
       console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error')
@@ -325,6 +342,60 @@ import { execFileSync } from 'node:child_process'
       process.exit(1)
     }
     return;
+  } else if (subcommand === 'acp') {
+    try {
+      const { runAcp, resolveAcpAgentConfig } = await import('@/agent/acp');
+
+      let startedBy: 'daemon' | 'terminal' | undefined = undefined;
+      let verbose = false;
+      const acpArgs: string[] = [];
+      let customCommandMode = false;
+      for (let i = 1; i < args.length; i++) {
+        if (!customCommandMode && args[i] === '--started-by') {
+          startedBy = args[++i] as 'daemon' | 'terminal';
+          continue;
+        }
+        if (!customCommandMode && args[i] === '--verbose') {
+          verbose = true;
+          continue;
+        }
+        if (args[i] === '--') {
+          customCommandMode = true;
+        }
+        acpArgs.push(args[i]);
+      }
+
+      const resolved = resolveAcpAgentConfig(acpArgs);
+      const { credentials } = await authAndSetupMachineIfNeeded();
+
+      logger.debug('Ensuring Happy background service is running & matches our version...');
+      if (!(await isDaemonRunningCurrentlyInstalledHappyVersion())) {
+        logger.debug('Starting Happy background service...');
+        const daemonProcess = spawnHappyCLI(['daemon', 'start-sync'], {
+          detached: true,
+          stdio: 'ignore',
+          env: process.env
+        });
+        daemonProcess.unref();
+        await new Promise(resolve => setTimeout(resolve, 200));
+      }
+
+      await runAcp({
+        credentials,
+        startedBy,
+        verbose,
+        agentName: resolved.agentName,
+        command: resolved.command,
+        args: resolved.args,
+      });
+    } catch (error) {
+      console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error')
+      if (process.env.DEBUG) {
+        console.error(error)
+      }
+      process.exit(1)
+    }
+    return;
   } else if (subcommand === 'logout') {
     // Keep for backward compatibility - redirect to auth logout
     console.log(chalk.yellow('Note: "happy logout" is deprecated. Use "happy auth logout" instead.\n'));
@@ -475,6 +546,10 @@ ${chalk.bold('To clean up runaway processes:')} Use ${chalk.cyan('happy doctor c
     let showVersion = false
     let chromeOverride: boolean | undefined = undefined  // Track explicit --chrome or --no-chrome
     const unknownArgs: string[] = [] // Collect unknown args to pass through to claude
+    const parsedSandboxFlag = extractNoSandboxFlag(args)
+    options.noSandbox = parsedSandboxFlag.noSandbox
+    args.length = 0
+    args.push(...parsedSandboxFlag.args)
 
     for (let i = 0; i < args.length; i++) {
       const arg = args[i]
@@ -559,7 +634,9 @@ ${chalk.bold('Usage:')}
   happy auth              Manage authentication
   happy codex             Start Codex mode
   happy gemini            Start Gemini mode (ACP)
+  happy acp               Start a generic ACP-compatible agent
   happy connect           Connect AI vendor API keys
+  happy sandbox           Configure and manage OS-level sandboxing
   happy notify            Send push notification
   happy daemon            Manage background service that allows
                             to spawn new sessions away from your computer
@@ -571,9 +648,15 @@ ${chalk.bold('Examples:')}
                             happy sugar for --dangerously-skip-permissions
   happy --chrome           Enable Chrome browser access for this session
   happy --no-chrome        Disable Chrome even if default is on
+  happy --no-sandbox       Disable Happy sandbox for this session
   happy --js-runtime bun   Use bun instead of node to spawn Claude Code
   happy --claude-env ANTHROPIC_BASE_URL=http://127.0.0.1:3456
                            Use a custom API endpoint (e.g., claude-code-router)
+  happy acp gemini         Start Gemini via generic ACP runner
+  happy acp -- opencode --acp
+                           Start a custom ACP command
+  happy acp opencode --verbose
+                           Print raw ACP backend/envelope events
   happy auth login --force Authenticate
   happy doctor             Run diagnostics
 

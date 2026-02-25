@@ -8,11 +8,10 @@ import { isMachineOnline } from '@/utils/machineUtils';
 import { applySettings, Settings } from "./settings";
 import { LocalSettings, applyLocalSettings } from "./localSettings";
 import { Purchases, customerInfoToPurchases } from "./purchases";
-import { TodoState } from "../-zen/model/ops";
 import { Profile } from "./profile";
 import { UserProfile, RelationshipUpdatedEvent } from "./friendTypes";
-import { loadSettings, loadLocalSettings, saveLocalSettings, saveSettings, loadPurchases, savePurchases, loadProfile, saveProfile, loadSessionDrafts, saveSessionDrafts, loadSessionPermissionModes, saveSessionPermissionModes } from "./persistence";
-import type { PermissionMode } from '@/components/PermissionModeSelector';
+import { loadSettings, loadLocalSettings, saveLocalSettings, saveSettings, loadPurchases, savePurchases, loadProfile, saveProfile, loadSessionDrafts, saveSessionDrafts, loadSessionPermissionModes, saveSessionPermissionModes, loadSessionCustomNames, saveSessionCustomNames } from "./persistence";
+import type { PermissionModeKey } from '@/components/PermissionModeSelector';
 import type { CustomerInfo } from './revenueCat/types';
 import React from "react";
 import { sync } from "./sync";
@@ -41,6 +40,11 @@ function resolveSessionOnlineState(session: { active: boolean; activeAt: number 
 function isSessionActive(session: { active: boolean; activeAt: number }): boolean {
     // Use the active flag directly, no timeout checks
     return session.active;
+}
+
+function isSandboxEnabled(metadata: Session['metadata'] | null | undefined): boolean {
+    const sandbox = metadata?.sandbox;
+    return !!sandbox && typeof sandbox === 'object' && (sandbox as { enabled?: unknown }).enabled === true;
 }
 
 // Known entitlement IDs
@@ -93,8 +97,6 @@ interface StorageState {
     socketLastDisconnectedAt: number | null;
     isDataReady: boolean;
     nativeUpdateStatus: { available: boolean; updateUrl?: string } | null;
-    todoState: TodoState | null;
-    todosLoaded: boolean;
     applySessions: (sessions: (Omit<Session, 'presence'> & { presence?: "online" | number })[]) => void;
     applyMachines: (machines: Machine[], replace?: boolean) => void;
     applyLoaded: () => void;
@@ -106,7 +108,6 @@ interface StorageState {
     applyLocalSettings: (settings: Partial<LocalSettings>) => void;
     applyPurchases: (customerInfo: CustomerInfo) => void;
     applyProfile: (profile: Profile) => void;
-    applyTodos: (todoState: TodoState) => void;
     applyGitStatus: (sessionId: string, status: GitStatus | null) => void;
     applyNativeUpdateStatus: (status: { available: boolean; updateUrl?: string } | null) => void;
     isMutableToolCall: (sessionId: string, callId: string) => boolean;
@@ -116,8 +117,9 @@ interface StorageState {
     setSocketStatus: (status: 'disconnected' | 'connecting' | 'connected' | 'error') => void;
     getActiveSessions: () => Session[];
     updateSessionDraft: (sessionId: string, draft: string | null) => void;
-    updateSessionPermissionMode: (sessionId: string, mode: 'default' | 'acceptEdits' | 'bypassPermissions' | 'plan' | 'read-only' | 'safe-yolo' | 'yolo') => void;
-    updateSessionModelMode: (sessionId: string, mode: 'default' | 'gemini-2.5-pro' | 'gemini-2.5-flash' | 'gemini-2.5-flash-lite') => void;
+    updateSessionPermissionMode: (sessionId: string, mode: string) => void;
+    updateSessionCustomName: (sessionId: string, customName: string | null) => void;
+    updateSessionModelMode: (sessionId: string, mode: string) => void;
     // Artifact methods
     applyArtifacts: (artifacts: DecryptedArtifact[]) => void;
     addArtifact: (artifact: DecryptedArtifact) => void;
@@ -250,6 +252,7 @@ export const storage = create<StorageState>()((set, get) => {
     let profile = loadProfile();
     let sessionDrafts = loadSessionDrafts();
     let sessionPermissionModes = loadSessionPermissionModes();
+    let sessionCustomNames = loadSessionCustomNames();
     return {
         settings,
         settingsVersion: version,
@@ -267,8 +270,6 @@ export const storage = create<StorageState>()((set, get) => {
         feedHasMore: false,
         feedLoaded: false,  // Initialize as false
         friendsLoaded: false,  // Initialize as false
-        todoState: null,  // Initialize todo state
-        todosLoaded: false,  // Initialize todos loaded state
         sessionsData: null,  // Legacy - to be removed
         sessionListViewData: null,
         sessionMessages: {},
@@ -303,6 +304,7 @@ export const storage = create<StorageState>()((set, get) => {
             // Load drafts and permission modes if sessions are empty (initial load)
             const savedDrafts = Object.keys(state.sessions).length === 0 ? sessionDrafts : {};
             const savedPermissionModes = Object.keys(state.sessions).length === 0 ? sessionPermissionModes : {};
+            const savedCustomNames = Object.keys(state.sessions).length === 0 ? sessionCustomNames : {};
 
             // Merge new sessions with existing ones
             const mergedSessions: Record<string, Session> = { ...state.sessions };
@@ -317,11 +319,21 @@ export const storage = create<StorageState>()((set, get) => {
                 const savedDraft = savedDrafts[session.id];
                 const existingPermissionMode = state.sessions[session.id]?.permissionMode;
                 const savedPermissionMode = savedPermissionModes[session.id];
+                const existingCustomName = state.sessions[session.id]?.customName;
+                const savedCustomName = savedCustomNames[session.id];
+                const defaultPermissionMode: PermissionModeKey = isSandboxEnabled(session.metadata) ? 'bypassPermissions' : 'default';
+                const resolvedPermissionMode: PermissionModeKey =
+                    (existingPermissionMode && existingPermissionMode !== 'default' ? existingPermissionMode : undefined) ||
+                    (savedPermissionMode && savedPermissionMode !== 'default' ? savedPermissionMode : undefined) ||
+                    (session.permissionMode && session.permissionMode !== 'default' ? session.permissionMode : undefined) ||
+                    defaultPermissionMode;
+
                 mergedSessions[session.id] = {
                     ...session,
                     presence,
                     draft: existingDraft || savedDraft || session.draft || null,
-                    permissionMode: existingPermissionMode || savedPermissionMode || session.permissionMode || 'default'
+                    permissionMode: resolvedPermissionMode,
+                    customName: existingCustomName || savedCustomName || session.customName || null
                 };
             });
 
@@ -667,13 +679,6 @@ export const storage = create<StorageState>()((set, get) => {
                 profile
             };
         }),
-        applyTodos: (todoState: TodoState) => set((state) => {
-            return {
-                ...state,
-                todoState,
-                todosLoaded: true
-            };
-        }),
         applyGitStatus: (sessionId: string, status: GitStatus | null) => set((state) => {
             // Update project git status as well
             projectManager.updateSessionProjectGitStatus(sessionId, status);
@@ -778,7 +783,7 @@ export const storage = create<StorageState>()((set, get) => {
                 sessionListViewData
             };
         }),
-        updateSessionPermissionMode: (sessionId: string, mode: 'default' | 'acceptEdits' | 'bypassPermissions' | 'plan' | 'read-only' | 'safe-yolo' | 'yolo') => set((state) => {
+        updateSessionPermissionMode: (sessionId: string, mode: string) => set((state) => {
             const session = state.sessions[sessionId];
             if (!session) return state;
 
@@ -792,7 +797,7 @@ export const storage = create<StorageState>()((set, get) => {
             };
 
             // Collect all permission modes for persistence
-            const allModes: Record<string, PermissionMode> = {};
+            const allModes: Record<string, string> = {};
             Object.entries(updatedSessions).forEach(([id, sess]) => {
                 if (sess.permissionMode && sess.permissionMode !== 'default') {
                     allModes[id] = sess.permissionMode;
@@ -808,7 +813,45 @@ export const storage = create<StorageState>()((set, get) => {
                 sessions: updatedSessions
             };
         }),
-        updateSessionModelMode: (sessionId: string, mode: 'default' | 'gemini-2.5-pro' | 'gemini-2.5-flash' | 'gemini-2.5-flash-lite') => set((state) => {
+        updateSessionCustomName: (sessionId: string, customName: string | null) => set((state) => {
+            const session = state.sessions[sessionId];
+            if (!session) return state;
+
+            const normalizedName = customName?.trim() ? customName.trim() : null;
+
+            // Collect all custom names for persistence
+            const allNames: Record<string, string> = {};
+            Object.entries(state.sessions).forEach(([id, sess]) => {
+                if (id === sessionId) {
+                    if (normalizedName) {
+                        allNames[id] = normalizedName;
+                    }
+                } else if (sess.customName) {
+                    allNames[id] = sess.customName;
+                }
+            });
+
+            // Persist custom names
+            saveSessionCustomNames(allNames);
+
+            const updatedSessions = {
+                ...state.sessions,
+                [sessionId]: {
+                    ...session,
+                    customName: normalizedName
+                }
+            };
+
+            // Rebuild sessionListViewData so the UI reflects the new custom name
+            const sessionListViewData = buildSessionListViewData(updatedSessions);
+
+            return {
+                ...state,
+                sessions: updatedSessions,
+                sessionListViewData
+            };
+        }),
+        updateSessionModelMode: (sessionId: string, mode: string) => set((state) => {
             const session = state.sessions[sessionId];
             if (!session) return state;
 
@@ -931,7 +974,11 @@ export const storage = create<StorageState>()((set, get) => {
             const modes = loadSessionPermissionModes();
             delete modes[sessionId];
             saveSessionPermissionModes(modes);
-            
+
+            const names = loadSessionCustomNames();
+            delete names[sessionId];
+            saveSessionCustomNames(names);
+
             // Rebuild sessionListViewData without the deleted session
             const sessionListViewData = buildSessionListViewData(remainingSessions);
             

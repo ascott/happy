@@ -13,12 +13,13 @@ import { resolve } from 'node:path';
 import type { AgentState, Metadata } from '@/api/types';
 import { configuration } from '@/configuration';
 import { projectPath } from '@/projectPath';
+import type { SandboxConfig } from '@/persistence';
 import packageJson from '../../package.json';
 
 /**
  * Backend flavor identifier for session metadata.
  */
-export type BackendFlavor = 'claude' | 'codex' | 'gemini';
+export type BackendFlavor = 'claude' | 'codex' | 'gemini' | 'opencode' | 'acp';
 
 /**
  * Options for creating session metadata.
@@ -30,6 +31,10 @@ export interface CreateSessionMetadataOptions {
     machineId: string;
     /** How the session was started */
     startedBy?: 'daemon' | 'terminal';
+    /** Active sandbox config for the session, or undefined when not used */
+    sandbox?: SandboxConfig;
+    /** Whether the backend runs with "dangerously skip permissions" behavior */
+    dangerouslySkipPermissions?: boolean;
 }
 
 /**
@@ -82,7 +87,9 @@ export function createSessionMetadata(opts: CreateSessionMetadataOptions): Sessi
         startedBy: opts.startedBy || 'terminal',
         lifecycleState: 'running',
         lifecycleStateSince: Date.now(),
-        flavor: opts.flavor
+        flavor: opts.flavor,
+        sandbox: opts.sandbox?.enabled ? opts.sandbox : null,
+        dangerouslySkipPermissions: opts.dangerouslySkipPermissions ?? null,
     };
 
     return { state, metadata };

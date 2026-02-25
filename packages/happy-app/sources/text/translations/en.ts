@@ -390,6 +390,8 @@ export const en: TranslationStructure = {
         deleteSessionWarning: 'This action cannot be undone. All messages and data associated with this session will be permanently deleted.',
         failedToDeleteSession: 'Failed to delete session',
         sessionDeleted: 'Session deleted successfully',
+        renameSession: 'Rename Session',
+        renameSessionPrompt: 'Enter a new name for this session',
 
     },
 
@@ -410,9 +412,9 @@ export const en: TranslationStructure = {
             default: 'Default',
             acceptEdits: 'Accept Edits',
             plan: 'Plan Mode',
-            bypassPermissions: 'Yolo Mode',
+            bypassPermissions: 'Yolo',
             badgeAcceptAllEdits: 'Accept All Edits',
-            badgeBypassAllPermissions: 'Bypass All Permissions',
+            badgeBypassAllPermissions: 'Yolo',
             badgePlanMode: 'Plan Mode',
         },
         agent: {

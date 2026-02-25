@@ -31,6 +31,8 @@ import { stopCaffeinate } from "@/utils/caffeinate";
 import { connectionState } from '@/utils/serverConnectionErrors';
 import { setupOfflineReconnection } from '@/utils/setupOfflineReconnection';
 import type { ApiSessionClient } from '@/api/apiSession';
+import { resolveCodexExecutionPolicy } from './executionPolicy';
+import { mapCodexMcpMessageToSessionEnvelopes, mapCodexProcessorMessageToSessionEnvelopes } from './utils/sessionProtocolMapper';
 
 type ReadyEventOptions = {
     pending: unknown;
@@ -66,6 +68,7 @@ export function emitReadyIfIdle({ pending, queueSize, shouldExit, sendReady, not
 export async function runCodex(opts: {
     credentials: Credentials;
     startedBy?: 'daemon' | 'terminal';
+    noSandbox?: boolean;
 }): Promise<void> {
     // Use shared PermissionMode type for cross-agent compatibility
     type PermissionMode = import('@/api/types').PermissionMode;
@@ -94,6 +97,7 @@ export async function runCodex(opts: {
 
     const settings = await readSettings();
     let machineId = settings?.machineId;
+    const sandboxConfig = opts.noSandbox ? undefined : settings?.sandboxConfig;
     if (!machineId) {
         console.error(`[START] No machine ID found in settings, which is unexpected since authAndSetupMachineIfNeeded should have created it. Please report this issue on https://github.com/slopus/happy-cli/issues`);
         process.exit(1);
@@ -111,7 +115,8 @@ export async function runCodex(opts: {
     const { state, metadata } = createSessionMetadata({
         flavor: 'codex',
         machineId,
-        startedBy: opts.startedBy
+        startedBy: opts.startedBy,
+        sandbox: sandboxConfig,
     });
     const response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
 
@@ -189,6 +194,10 @@ export async function runCodex(opts: {
         messageQueue.push(message.content.text, enhancedMode);
     });
     let thinking = false;
+    let currentTurnId: string | null = null;
+    let codexStartedSubagents = new Set<string>();
+    let codexActiveSubagents = new Set<string>();
+    let codexProviderSubagentToSessionSubagent = new Map<string, string>();
     session.keepAlive(thinking, 'remote');
     // Periodic keep-alive; store handle so we can clear on exit
     const keepAliveInterval = setInterval(() => {
@@ -352,7 +361,7 @@ export async function runCodex(opts: {
     // Start Context 
     //
 
-    const client = new CodexMcpClient();
+    const client = new CodexMcpClient(sandboxConfig);
 
     // Helper: find Codex session transcript for a given sessionId
     function findCodexResumeFile(sessionId: string | null): string | null {
@@ -397,12 +406,16 @@ export async function runCodex(opts: {
     }
     permissionHandler = new CodexPermissionHandler(session);
     const reasoningProcessor = new ReasoningProcessor((message) => {
-        // Callback to send messages directly from the processor
-        session.sendCodexMessage(message);
+        const envelopes = mapCodexProcessorMessageToSessionEnvelopes(message, { currentTurnId });
+        for (const envelope of envelopes) {
+            session.sendSessionProtocolMessage(envelope);
+        }
     });
     const diffProcessor = new DiffProcessor((message) => {
-        // Callback to send messages directly from the processor
-        session.sendCodexMessage(message);
+        const envelopes = mapCodexProcessorMessageToSessionEnvelopes(message, { currentTurnId });
+        for (const envelope of envelopes) {
+            session.sendSessionProtocolMessage(envelope);
+        }
     });
     client.setPermissionHandler(permissionHandler);
     client.setHandler((msg) => {
@@ -462,62 +475,18 @@ export async function runCodex(opts: {
             // Complete the reasoning section - tool results or reasoning messages sent via callback
             reasoningProcessor.complete(msg.text);
         }
-        if (msg.type === 'agent_message') {
-            session.sendCodexMessage({
-                type: 'message',
-                message: msg.message,
-                id: randomUUID()
-            });
-        }
-        if (msg.type === 'exec_command_begin' || msg.type === 'exec_approval_request') {
-            let { call_id, type, ...inputs } = msg;
-            session.sendCodexMessage({
-                type: 'tool-call',
-                name: 'CodexBash',
-                callId: call_id,
-                input: inputs,
-                id: randomUUID()
-            });
-        }
-        if (msg.type === 'exec_command_end') {
-            let { call_id, type, ...output } = msg;
-            session.sendCodexMessage({
-                type: 'tool-call-result',
-                callId: call_id,
-                output: output,
-                id: randomUUID()
-            });
-        }
-        if (msg.type === 'token_count') {
-            session.sendCodexMessage({
-                ...msg,
-                id: randomUUID()
-            });
-        }
         if (msg.type === 'patch_apply_begin') {
             // Handle the start of a patch operation
-            let { call_id, auto_approved, changes } = msg;
+            let { auto_approved, changes } = msg;
 
             // Add UI feedback for patch operation
             const changeCount = Object.keys(changes).length;
             const filesMsg = changeCount === 1 ? '1 file' : `${changeCount} files`;
             messageBuffer.addMessage(`Modifying ${filesMsg}...`, 'tool');
-
-            // Send tool call message
-            session.sendCodexMessage({
-                type: 'tool-call',
-                name: 'CodexPatch',
-                callId: call_id,
-                input: {
-                    auto_approved,
-                    changes
-                },
-                id: randomUUID()
-            });
         }
         if (msg.type === 'patch_apply_end') {
             // Handle the end of a patch operation
-            let { call_id, stdout, stderr, success } = msg;
+            let { stdout, stderr, success } = msg;
 
             // Add UI feedback for completion
             if (success) {
@@ -527,23 +496,29 @@ export async function runCodex(opts: {
                 const errorMsg = stderr || 'Failed to modify files';
                 messageBuffer.addMessage(`Error: ${errorMsg.substring(0, 200)}`, 'result');
             }
-
-            // Send tool call result message
-            session.sendCodexMessage({
-                type: 'tool-call-result',
-                callId: call_id,
-                output: {
-                    stdout,
-                    stderr,
-                    success
-                },
-                id: randomUUID()
-            });
         }
         if (msg.type === 'turn_diff') {
             // Handle turn_diff messages and track unified_diff changes
             if (msg.unified_diff) {
                 diffProcessor.processDiff(msg.unified_diff);
+            }
+        }
+
+        // Convert Codex MCP events into the unified session-protocol envelope stream.
+        // Reasoning deltas are handled by ReasoningProcessor to avoid duplicate text output.
+        if (msg.type !== 'agent_reasoning_delta' && msg.type !== 'agent_reasoning' && msg.type !== 'agent_reasoning_section_break' && msg.type !== 'turn_diff') {
+            const mapped = mapCodexMcpMessageToSessionEnvelopes(msg, {
+                currentTurnId,
+                startedSubagents: codexStartedSubagents,
+                activeSubagents: codexActiveSubagents,
+                providerSubagentToSessionSubagent: codexProviderSubagentToSessionSubagent,
+            });
+            currentTurnId = mapped.currentTurnId;
+            codexStartedSubagents = mapped.startedSubagents;
+            codexActiveSubagents = mapped.activeSubagents;
+            codexProviderSubagentToSessionSubagent = mapped.providerSubagentToSessionSubagent;
+            for (const envelope of mapped.envelopes) {
+                session.sendSessionProtocolMessage(envelope);
             }
         }
     });
@@ -632,40 +607,17 @@ export async function runCodex(opts: {
 
             try {
                 // Map permission mode to approval policy and sandbox for startSession
-                const approvalPolicy = (() => {
-                    switch (message.mode.permissionMode) {
-                        // Codex native modes
-                        case 'default': return 'untrusted' as const;                    // Ask for non-trusted commands
-                        case 'read-only': return 'never' as const;                      // Never ask, read-only enforced by sandbox
-                        case 'safe-yolo': return 'on-failure' as const;                 // Auto-run, ask only on failure
-                        case 'yolo': return 'on-failure' as const;                      // Auto-run, ask only on failure
-                        // Defensive fallback for Claude-specific modes (backward compatibility)
-                        case 'bypassPermissions': return 'on-failure' as const;         // Full access: map to yolo behavior
-                        case 'acceptEdits': return 'on-request' as const;               // Let model decide (closest to auto-approve edits)
-                        case 'plan': return 'untrusted' as const;                       // Conservative: ask for non-trusted
-                        default: return 'untrusted' as const;                           // Safe fallback
-                    }
-                })();
-                const sandbox = (() => {
-                    switch (message.mode.permissionMode) {
-                        // Codex native modes
-                        case 'default': return 'workspace-write' as const;              // Can write in workspace
-                        case 'read-only': return 'read-only' as const;                  // Read-only filesystem
-                        case 'safe-yolo': return 'workspace-write' as const;            // Can write in workspace
-                        case 'yolo': return 'danger-full-access' as const;              // Full system access
-                        // Defensive fallback for Claude-specific modes
-                        case 'bypassPermissions': return 'danger-full-access' as const; // Full access: map to yolo
-                        case 'acceptEdits': return 'workspace-write' as const;          // Can edit files in workspace
-                        case 'plan': return 'workspace-write' as const;                 // Can write for planning
-                        default: return 'workspace-write' as const;                     // Safe default
-                    }
-                })();
+                const sandboxManagedByHappy = client.sandboxEnabled;
+                const executionPolicy = resolveCodexExecutionPolicy(
+                    message.mode.permissionMode,
+                    sandboxManagedByHappy,
+                );
 
                 if (!wasCreated) {
                     const startConfig: CodexSessionConfig = {
                         prompt: first ? message.message + '\n\n' + CHANGE_TITLE_INSTRUCTION : message.message,
-                        sandbox,
-                        'approval-policy': approvalPolicy,
+                        sandbox: executionPolicy.sandbox,
+                        'approval-policy': executionPolicy.approvalPolicy,
                         config: { mcp_servers: mcpServers }
                     };
                     if (message.mode.model) {

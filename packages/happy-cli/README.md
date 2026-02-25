@@ -10,6 +10,18 @@ Free. Open source. Code anywhere.
 npm install -g happy-coder
 ```
 
+## Run From Source
+
+From a repo checkout:
+
+```bash
+# repository root
+yarn cli --help
+
+# package directory
+yarn cli --help
+```
+
 ## Usage
 
 ### Claude (default)
@@ -44,11 +56,13 @@ happy connect gemini
 - `happy` – Start Claude Code session (default)
 - `happy gemini` – Start Gemini CLI session
 - `happy codex` – Start Codex mode
+- `happy acp` – Start a generic ACP-compatible agent
 
 ### Utility Commands
 
 - `happy auth` – Manage authentication
 - `happy connect` – Store AI vendor API keys in Happy cloud
+- `happy sandbox` – Configure sandbox runtime restrictions
 - `happy notify` – Send a push notification to your devices
 - `happy daemon` – Manage background service
 - `happy doctor` – System diagnostics & troubleshooting
@@ -74,6 +88,23 @@ happy gemini project get          # Show current Google Cloud Project ID
 
 **Available models:** `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.5-flash-lite`
 
+### Generic ACP Commands
+
+```bash
+happy acp gemini                     # Run built-in Gemini ACP command
+happy acp opencode                   # Run built-in OpenCode ACP command
+happy acp opencode --verbose         # Include raw backend/envelope logs
+happy acp -- custom-agent --flag     # Run any ACP-compatible command directly
+```
+
+### Sandbox Subcommands
+
+```bash
+happy sandbox configure  # Interactive sandbox setup wizard
+happy sandbox status     # Show current sandbox configuration
+happy sandbox disable    # Disable sandboxing
+```
+
 ## Options
 
 ### Claude Options
@@ -87,6 +118,7 @@ happy gemini project get          # Show current Google Cloud Project ID
 
 - `-h, --help` - Show help
 - `-v, --version` - Show version
+- `--no-sandbox` - Disable sandbox for the current Claude/Codex run
 
 ## Environment Variables
 

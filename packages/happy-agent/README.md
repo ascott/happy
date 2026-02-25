@@ -135,6 +135,22 @@ All session data is end-to-end encrypted. New sessions use AES-256-GCM with per-
 - Node.js >= 20.0.0
 - A Happy mobile app account for authentication
 
+## Publishing to npm
+
+Maintainers can publish a new version:
+
+```bash
+yarn release               # From repo root: choose library to release
+# or directly:
+yarn workspace happy-agent release
+```
+
+This flow:
+- runs tests/build checks via `prepublishOnly`
+- creates a release commit and `happy-agent-vX.Y.Z` tag
+- creates a GitHub release with generated notes
+- publishes `happy-agent` to npm
+
 ## License
 
 MIT
